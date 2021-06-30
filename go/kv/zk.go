@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/github/orchestrator/go/config"
+	"github.com/openark/orchestrator/go/config"
 	"github.com/outbrain/zookeepercli/zk"
 	zkconstants "github.com/samuel/go-zookeeper/zk"
 )
@@ -73,6 +73,18 @@ func (this *zkStore) GetKeyValue(key string) (value string, found bool, err erro
 		return value, false, err
 	}
 	return string(result), true, nil
+}
+
+func (this *zkStore) PutKVPairs(kvPairs []*KVPair) (err error) {
+	if this.zook == nil {
+		return nil
+	}
+	for _, pair := range kvPairs {
+		if err := this.PutKeyValue(pair.Key, pair.Value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (this *zkStore) DistributePairs(kvPairs [](*KVPair)) (err error) {

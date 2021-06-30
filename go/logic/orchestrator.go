@@ -26,17 +26,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/github/orchestrator/go/agent"
-	"github.com/github/orchestrator/go/collection"
-	"github.com/github/orchestrator/go/config"
-	"github.com/github/orchestrator/go/discovery"
-	"github.com/github/orchestrator/go/inst"
-	"github.com/github/orchestrator/go/kv"
-	ometrics "github.com/github/orchestrator/go/metrics"
-	"github.com/github/orchestrator/go/process"
-	"github.com/github/orchestrator/go/raft"
-	"github.com/github/orchestrator/go/util"
 	"github.com/openark/golib/log"
+	"github.com/openark/orchestrator/go/agent"
+	"github.com/openark/orchestrator/go/collection"
+	"github.com/openark/orchestrator/go/config"
+	"github.com/openark/orchestrator/go/discovery"
+	"github.com/openark/orchestrator/go/inst"
+	"github.com/openark/orchestrator/go/kv"
+	ometrics "github.com/openark/orchestrator/go/metrics"
+	"github.com/openark/orchestrator/go/process"
+	"github.com/openark/orchestrator/go/raft"
+	"github.com/openark/orchestrator/go/util"
 	"github.com/patrickmn/go-cache"
 	"github.com/rcrowley/go-metrics"
 	"github.com/sjmudd/stopwatch"
@@ -190,6 +190,11 @@ func DiscoverInstance(instanceKey inst.InstanceKey) {
 		log.Debugf("discoverInstance: skipping discovery of %+v because it is set to be forgotten", instanceKey)
 		return
 	}
+	if inst.FiltersMatchInstanceKey(&instanceKey, config.Config.DiscoveryIgnoreHostnameFilters) {
+		log.Debugf("discoverInstance: skipping discovery of %+v because it matches DiscoveryIgnoreHostnameFilters", instanceKey)
+		return
+	}
+
 	// create stopwatch entries
 	latency := stopwatch.NewNamedStopwatch()
 	latency.AddMany([]string{
@@ -249,7 +254,7 @@ func DiscoverInstance(instanceKey inst.InstanceKey) {
 			Err:             err,
 		})
 		if util.ClearToLog("discoverInstance", instanceKey.StringCode()) {
-			log.Warningf(" DiscoverInstance(%+v) instance is nil in %.3fs (Backend: %.3fs, Instance: %.3fs), error=%+v",
+			log.Warningf("DiscoverInstance(%+v) instance is nil in %.3fs (Backend: %.3fs, Instance: %.3fs), error=%+v",
 				instanceKey,
 				totalLatency.Seconds(),
 				backendLatency.Seconds(),
@@ -274,12 +279,12 @@ func DiscoverInstance(instanceKey inst.InstanceKey) {
 		return
 	}
 
-	// Investigate replicas:
-	for _, replicaKey := range instance.SlaveHosts.GetInstanceKeys() {
+	// Investigate replicas and members of the same replication group:
+	for _, replicaKey := range append(instance.ReplicationGroupMembers.GetInstanceKeys(), instance.Replicas.GetInstanceKeys()...) {
 		replicaKey := replicaKey // not needed? no concurrency here?
 
 		// Avoid noticing some hosts we would otherwise discover
-		if inst.RegexpMatchPatterns(replicaKey.StringCode(), config.Config.DiscoveryIgnoreReplicaHostnameFilters) {
+		if inst.FiltersMatchInstanceKey(&replicaKey, config.Config.DiscoveryIgnoreReplicaHostnameFilters) {
 			continue
 		}
 
@@ -289,7 +294,9 @@ func DiscoverInstance(instanceKey inst.InstanceKey) {
 	}
 	// Investigate master:
 	if instance.MasterKey.IsValid() {
-		discoveryQueue.Push(instance.MasterKey)
+		if !inst.FiltersMatchInstanceKey(&instance.MasterKey, config.Config.DiscoveryIgnoreMasterHostnameFilters) {
+			discoveryQueue.Push(instance.MasterKey)
+		}
 	}
 }
 
@@ -304,11 +311,11 @@ func onHealthTick() {
 			atomic.StoreInt64(&isElectedNode, 0)
 		}
 		if process.SinceLastGoodHealthCheck() > yieldAfterUnhealthyDuration {
-			log.Errorf("Heath test is failing for over %+v seconds. raft yielding", yieldAfterUnhealthyDuration.Seconds())
+			log.Errorf("Health test is failing for over %+v seconds. raft yielding", yieldAfterUnhealthyDuration.Seconds())
 			orcraft.Yield()
 		}
 		if process.SinceLastGoodHealthCheck() > fatalAfterUnhealthyDuration {
-			orcraft.FatalRaftError(fmt.Errorf("Node is unable to register health. Please check database connnectivity."))
+			orcraft.FatalRaftError(fmt.Errorf("Node is unable to register health. Please check database connnectivity and/or time synchronisation."))
 		}
 	}
 	if !orcraft.IsRaftEnabled() {
@@ -435,14 +442,19 @@ func SubmitMastersToKvStores(clusterName string, force bool) (kvPairs [](*kv.KVP
 		submitKvPairs = append(submitKvPairs, kvPair)
 	}
 	log.Debugf("kv.SubmitMastersToKvStores: submitKvPairs: %+v", len(submitKvPairs))
-	for _, kvPair := range submitKvPairs {
-		if orcraft.IsRaftEnabled() {
-			_, err = orcraft.PublishCommand("put-key-value", kvPair)
-		} else {
-			err = kv.PutKVPair(kvPair)
+	if orcraft.IsRaftEnabled() {
+		for _, kvPair := range submitKvPairs {
+			_, err := orcraft.PublishCommand("put-key-value", kvPair)
+			if err == nil {
+				submittedCount++
+			} else {
+				selectedError = err
+			}
 		}
+	} else {
+		err := kv.PutKVPairs(submitKvPairs)
 		if err == nil {
-			submittedCount++
+			submittedCount += len(submitKvPairs)
 		} else {
 			selectedError = err
 		}
@@ -451,6 +463,19 @@ func SubmitMastersToKvStores(clusterName string, force bool) (kvPairs [](*kv.KVP
 		log.Errore(err)
 	}
 	return kvPairs, submittedCount, log.Errore(selectedError)
+}
+
+func injectSeeds(seedOnce *sync.Once) {
+	seedOnce.Do(func() {
+		for _, seed := range config.Config.DiscoverySeeds {
+			instanceKey, err := inst.ParseRawInstanceKey(seed)
+			if err == nil {
+				inst.InjectSeed(instanceKey)
+			} else {
+				log.Errorf("Error parsing seed %s: %+v", seed, err)
+			}
+		}
+	})
 }
 
 // ContinuousDiscovery starts an asynchronuous infinite discovery process where instances are
@@ -480,6 +505,8 @@ func ContinuousDiscovery() {
 	runCheckAndRecoverOperationsTimeRipe := func() bool {
 		return time.Since(continuousDiscoveryStartTime) >= checkAndRecoverWaitPeriod
 	}
+
+	var seedOnce sync.Once
 
 	go ometrics.InitMetrics()
 	go ometrics.InitGraphiteMetrics()
@@ -511,6 +538,7 @@ func ContinuousDiscovery() {
 				if IsLeaderOrActive() {
 					go inst.UpdateClusterAliases()
 					go inst.ExpireDowntime()
+					go injectSeeds(&seedOnce)
 				}
 			}()
 		case <-autoPseudoGTIDTick:
@@ -528,6 +556,7 @@ func ContinuousDiscovery() {
 					go inst.InjectUnseenMasters()
 
 					go inst.ForgetLongUnseenInstances()
+					go inst.ForgetLongUnseenClusterAliases()
 					go inst.ForgetUnseenInstancesDifferentlyResolved()
 					go inst.ForgetExpiredHostnameResolves()
 					go inst.DeleteInvalidHostnameResolves()
@@ -541,6 +570,7 @@ func ContinuousDiscovery() {
 					go inst.ExpirePoolInstances()
 					go inst.FlushNontrivialResolveCacheToDatabase()
 					go inst.ExpireInjectedPseudoGTID()
+					go inst.ExpireStaleInstanceBinlogCoordinates()
 					go process.ExpireNodesHistory()
 					go process.ExpireAccessTokens()
 					go process.ExpireAvailableNodes()

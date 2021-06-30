@@ -17,11 +17,13 @@
 package kv
 
 import (
+	"crypto/tls"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 
-	"github.com/github/orchestrator/go/config"
+	"github.com/openark/orchestrator/go/config"
 
 	consulapi "github.com/armon/consul-api"
 	"github.com/patrickmn/go-cache"
@@ -29,7 +31,12 @@ import (
 	"github.com/openark/golib/log"
 )
 
-// A Consul store based on config's `ConsulAddress` and `ConsulKVPrefix`
+// getConsulKVCacheKey returns a Consul KV cache key for a given datacenter
+func getConsulKVCacheKey(dc, key string) string {
+	return fmt.Sprintf("%s;%s", dc, key)
+}
+
+// A Consul store based on config's `ConsulAddress`, `ConsulScheme`, and `ConsulKVPrefix`
 type consulStore struct {
 	client                        *consulapi.Client
 	kvCache                       *cache.Cache
@@ -47,6 +54,12 @@ func NewConsulStore() KVStore {
 	if config.Config.ConsulAddress != "" {
 		consulConfig := consulapi.DefaultConfig()
 		consulConfig.Address = config.Config.ConsulAddress
+		consulConfig.Scheme = config.Config.ConsulScheme
+		if config.Config.ConsulScheme == "https" {
+			consulConfig.HttpClient = &http.Client{
+				Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+			}
+		}
 		// ConsulAclToken defaults to ""
 		consulConfig.Token = config.Config.ConsulAclToken
 		if client, err := consulapi.NewClient(consulConfig); err != nil {
@@ -76,6 +89,18 @@ func (this *consulStore) GetKeyValue(key string) (value string, found bool, err 
 		return value, found, err
 	}
 	return string(pair.Value), (pair != nil), nil
+}
+
+func (this *consulStore) PutKVPairs(kvPairs []*KVPair) (err error) {
+	if this.client == nil {
+		return nil
+	}
+	for _, pair := range kvPairs {
+		if err := this.PutKeyValue(pair.Key, pair.Value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (this *consulStore) DistributePairs(kvPairs [](*KVPair)) (err error) {
@@ -115,7 +140,7 @@ func (this *consulStore) DistributePairs(kvPairs [](*KVPair)) (err error) {
 
 			for _, consulPair := range consulPairs {
 				val := string(consulPair.Value)
-				kcCacheKey := fmt.Sprintf("%s;%s", datacenter, consulPair.Key)
+				kcCacheKey := getConsulKVCacheKey(datacenter, consulPair.Key)
 
 				if value, found := this.kvCache.Get(kcCacheKey); found && val == value {
 					skipped++
